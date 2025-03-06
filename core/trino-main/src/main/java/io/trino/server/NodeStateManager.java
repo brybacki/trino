@@ -18,8 +18,12 @@ import io.airlift.bootstrap.LifeCycleManager;
 import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 import io.trino.execution.SqlTaskManager;
+import io.trino.execution.StateMachine;
+import io.trino.execution.TaskId;
 import io.trino.execution.TaskInfo;
+import io.trino.execution.TaskState;
 import io.trino.metadata.NodeState;
+import org.assertj.core.util.VisibleForTesting;
 
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -30,6 +34,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
@@ -54,13 +59,19 @@ public class NodeStateManager
     private final ScheduledExecutorService shutdownHandler = newSingleThreadScheduledExecutor(threadsNamed("shutdown-handler-%s"));
     private final ExecutorService lifeCycleStopper = newSingleThreadExecutor(threadsNamed("lifecycle-stopper-%s"));
     private final LifeCycleManager lifeCycleManager;
-    private final SqlTaskManager sqlTaskManager;
+    private final SqlTasksObservable sqlTasksObservable;
+    private final Supplier<List<TaskInfo>> taskInfoSupplier;
     private final boolean isCoordinator;
     private final ShutdownAction shutdownAction;
     private final Duration gracePeriod;
 
-    private final ScheduledExecutorService executor = newSingleThreadScheduledExecutor(threadsNamed("drain-handler-%s"));
+    private ScheduledExecutorService executor;
     private final AtomicReference<NodeState> nodeState = new AtomicReference<>(ACTIVE);
+
+    public interface SqlTasksObservable
+    {
+        void addStateChangeListener(TaskId taskId, StateMachine.StateChangeListener<TaskState> stateChangeListener);
+    }
 
     @Inject
     public NodeStateManager(
@@ -69,11 +80,30 @@ public class NodeStateManager
             ShutdownAction shutdownAction,
             LifeCycleManager lifeCycleManager)
     {
-        this.sqlTaskManager = requireNonNull(sqlTaskManager, "sqlTaskManager is null");
+        this(requireNonNull(sqlTaskManager, "sqlTaskManager is null")::addStateChangeListener,
+                requireNonNull(sqlTaskManager, "sqlTaskManager is null")::getAllTaskInfo,
+                serverConfig,
+                shutdownAction,
+                lifeCycleManager,
+                newSingleThreadScheduledExecutor(threadsNamed("drain-handler-%s")));
+    }
+
+    @VisibleForTesting
+    public NodeStateManager(
+            SqlTasksObservable sqlTasksObservable,
+            Supplier<List<TaskInfo>> taskInfoSupplier,
+            ServerConfig serverConfig,
+            ShutdownAction shutdownAction,
+            LifeCycleManager lifeCycleManager,
+            ScheduledExecutorService executor)
+    {
+        this.sqlTasksObservable = requireNonNull(sqlTasksObservable, "sqlTasksObservable is null");
+        this.taskInfoSupplier = requireNonNull(taskInfoSupplier, "taskInfoSupplier is null");
         this.shutdownAction = requireNonNull(shutdownAction, "shutdownAction is null");
         this.lifeCycleManager = requireNonNull(lifeCycleManager, "lifeCycleManager is null");
         this.isCoordinator = serverConfig.isCoordinator();
         this.gracePeriod = serverConfig.getGracePeriod();
+        this.executor = requireNonNull(executor, "executor is null");
     }
 
     public NodeState getServerState()
@@ -245,7 +275,7 @@ public class NodeStateManager
         final CountDownLatch countDownLatch = new CountDownLatch(activeTasks.size());
 
         for (TaskInfo taskInfo : activeTasks) {
-            sqlTaskManager.addStateChangeListener(taskInfo.taskStatus().getTaskId(), newState -> {
+            sqlTasksObservable.addStateChangeListener(taskInfo.taskStatus().getTaskId(), newState -> {
                 if (newState.isDone()) {
                     countDownLatch.countDown();
                 }
@@ -275,7 +305,7 @@ public class NodeStateManager
 
     private List<TaskInfo> getActiveTasks()
     {
-        return sqlTaskManager.getAllTaskInfo()
+        return taskInfoSupplier.get()
                 .stream()
                 .filter(taskInfo -> !taskInfo.taskStatus().getState().isDone())
                 .collect(toImmutableList());
