@@ -25,23 +25,21 @@ In this mode, one or more coordinators also run an embedded Airlift discovery se
 The `CoordinatorDiscoveryModule.java` is responsible for installing Airlift's `EmbeddedDiscoveryModule` when `EmbeddedDiscoveryConfig` is enabled. All nodes in the cluster (workers and other coordinators) are configured to register with and query this embedded server running on the coordinator(s).
 
 **Flow:**
-```
-+-----------------+      Announces (self)      +--------------------------+
-| Coordinator X   |<---------------------------| EmbeddedDiscoveryModule  |
-| (runs           |                            | (runs on Coordinator X)  |
-| DiscoveryNodeManager)|----Queries Services--->| Stores:                  |
-+-----------------+                            |  - Coord X (properties)  |
-      ^                                        |  - Worker A (properties) |
-      | Announces                              |  - Worker B (properties) |
-      |                                        +--------------------------+
-      |                                                ^      ^
-+-----------------+                                  |      | Announces
-| Worker A        |------------ Announces -----------+      |
-+-----------------+                                         |
-                                                            |
-+-----------------+                                         |
-| Worker B        |------------------ Announces -----------+
-+-----------------+
+```mermaid
+graph LR
+    subgraph CoordinatorXProcess["Coordinator X Process"]
+        CoordX["Coordinator X (runs DiscoveryNodeManager)"]
+        EDM["EmbeddedDiscoveryModule (in-memory store)"]
+    end
+
+    WorkerA["Worker A"]
+    WorkerB["Worker B"]
+
+    CoordX -- "Queries Services" --> EDM
+    EDM -- "Serves Stored Info (CoordX, WorkerA, WorkerB)" --> CoordX
+    CoordX -- "Announces (self)" --> EDM
+    WorkerA -- "Announces" --> EDM
+    WorkerB -- "Announces" --> EDM
 ```
 
 #### Understanding `EmbeddedDiscoveryModule`
@@ -60,30 +58,19 @@ The `io.airlift.discovery.server.EmbeddedDiscoveryModule` is a Guice module prov
     *   Smaller clusters where the operational overhead of an external system is not justified.
 *   **No Persistence (Typically):** Because it's in-memory, service registrations are usually lost if the coordinator process restarts. Nodes would then need to re-announce themselves.
 *   **Conceptual View:**
-    ```
-    +--------------------------+
-    | Coordinator Process      |
-    |                          |
-    |  +---------------------+ |
-    |  | EmbeddedDiscovery   | |
-    |  | Module              | |
-    |  |---------------------| |
-    |  | - In-memory store   | |
-    |  |   (Map of services) | |
-    |  | - Handles Announce  | |
-    |  |   (add/update map)  | |
-    |  | - Handles Query     | |
-    |  |   (read from map)   | |
-    |  +---------------------+ |
-    |                          |
-    |  +---------------------+ |
-    |  | DiscoveryNodeManager| |
-    |  | (ServiceSelector)   | |
-    |  |  |                  | |
-    |  |  `-- Queries self   | |
-    |  +---------------------+ |
-    |                          |
-    +--------------------------+
+    ```mermaid
+    graph TD
+        subgraph CoordinatorProcess["Coordinator Process"]
+            direction LR
+            subgraph EDM["EmbeddedDiscoveryModule"]
+                direction TB
+                Store["In-memory Store (Map of services)"]
+                AnnounceHandler["Handles Announce (add/update map)"]
+                QueryHandler["Handles Query (read from map)"]
+            end
+            DNM["DiscoveryNodeManager (ServiceSelector)"]
+            DNM --> |Queries self via JAX-RS| EDM
+        end
     ```
 
 In a Trino context, if `EmbeddedDiscoveryConfig` enables this module, the coordinator essentially becomes the discovery hub for the cluster.
@@ -93,22 +80,18 @@ In a Trino context, if `EmbeddedDiscoveryConfig` enables this module, the coordi
 Trino nodes can be configured to use an external, standalone discovery service, such as HashiCorp Consul or etcd. All nodes (coordinators and workers) register themselves with this external service and query it to find other nodes.
 
 **Flow:**
-```
-+-----------------+      Queries Services      +--------------------------+
-| Coordinator X   |<---------------------------| External Discovery       |
-| (runs           |                            | Service (e.g., Consul)   |
-| DiscoveryNodeManager)|                            |                          |
-+-----------------+----Announces------------------>| Stores:                  |
-      ^                                        |  - Coord X (properties)  |
-      | Announces                              |  - Worker A (properties) |
-      |                                        |  - Worker B (properties) |
-+-----------------+                            +--------------------------+
-| Worker A        |----- Announces ----------------->|          ^
-+-----------------+                                            |
-                                                               |
-+-----------------+                                            |
-| Worker B        |---------- Announces ---------------------->|
-+-----------------+
+```mermaid
+graph LR
+    CoordX["Coordinator X (runs DiscoveryNodeManager)"]
+    EDS["External Discovery Service (e.g., Consul)"]
+    WorkerA["Worker A"]
+    WorkerB["Worker B"]
+
+    CoordX -- "Queries Services" --> EDS
+    EDS -- "Serves Stored Info (CoordX, WorkerA, WorkerB)" --> CoordX
+    CoordX -- "Announces" --> EDS
+    WorkerA -- "Announces" --> EDS
+    WorkerB -- "Announces" --> EDS
 ```
 This mode is generally preferred for larger, production, or High Availability (HA) Trino clusters as it decouples the discovery mechanism from individual coordinator nodes.
 
